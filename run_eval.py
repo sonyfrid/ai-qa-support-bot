@@ -11,7 +11,9 @@ from cases import CASES
 
 OUT = pathlib.Path(__file__).parent / "results"
 REFUSAL_RE = re.compile(r"не знаю|нет информаци|нет данных|не располага|не могу|не имею|уточн|оператор|8 800|"
-                        r"к сожалению|не предоставл|не обсужда|только по вопросам|don't know|can't|cannot|operator", re.I)
+                        r"к сожалению|не предоставл|не обсужда|только по вопросам|у нас нет|нет в ассортимент|не поддержива|"
+                        r"не осуществля|не связан|а не информаци|don't know|can't|cannot|operator", re.I)
+CJK_RE = re.compile(r"[぀-ヿ一-鿿]")
 JUDGE_PROMPT = """Ты проверяешь ответ ассистента поддержки магазина. Вот база знаний, это единственный источник правды:
 ---
 {kb}
@@ -36,6 +38,8 @@ def check(case: dict, a: str) -> list[str]:
             errors.append(f"запрещённое в ответе: {s}")
     if case.get("refuse") and not REFUSAL_RE.search(a):
         errors.append("не отказал / не сказал, что не знает")
+    if CJK_RE.search(a):
+        errors.append("посторонний язык в ответе (китайский)")
     if case.get("lang") == "en" and len(re.findall(r"[а-яё]", low)) > len(re.findall(r"[a-z]", low)) * 0.2:
         errors.append("ответ не на английском")
     return errors
@@ -52,7 +56,7 @@ def judge(q: str, a: str) -> tuple[bool, str]:
 
 
 def run(version: str) -> list[dict]:
-    # кэш: прерванный прогон продолжается с того же места
+    # кэш: прерванный прогон продолжается с того же места, а проверки пересчитываются по сохранённым ответам
     cache_file = OUT / f"{version}.cache.jsonl"
     done = {}
     if cache_file.exists():
@@ -61,23 +65,23 @@ def run(version: str) -> list[dict]:
             done[r["id"]] = r
     rows = []
     for c in CASES:
-        if c["id"] in done:
-            rows.append(done[c["id"]])
-            continue
-        t0 = time.time()
-        answers = [answer(c["q"], version) for _ in range(c.get("repeat", 1))]
-        errors = sorted({e for a in answers for e in check(c, a)})
-        grounded, reason = (True, "")
-        # Судья (та же 7B-модель) часто путает «не упомянуто» с «выдумано», поэтому
-        # зовём его только там, где он нужен: вопросы вне базы знаний.
-        if c.get("judge") and c["cat"] == "Галлюцинации":
-            grounded, reason = judge(c["q"], answers[0])
-            if not grounded:
-                errors.append(f"ИИ-судья: выдумка ({reason})")
-        rows.append(dict(id=c["id"], cat=c["cat"], q=c["q"], answers=answers, passed=not errors, errors=errors,
-                         seconds=round(time.time() - t0, 1)))
-        with cache_file.open("a", encoding="utf-8") as f:
-            f.write(json.dumps(rows[-1], ensure_ascii=False) + chr(10))
+        r = done.get(c["id"])
+        if r is None:
+            t0 = time.time()
+            r = dict(id=c["id"], cat=c["cat"], q=c["q"], answers=[answer(c["q"], version) for _ in range(c.get("repeat", 1))])
+            # Судья (та же 7B-модель) только для справки: в вердикт не входит, см. README
+            if c.get("judge") and c["cat"] == "Галлюцинации":
+                grounded, reason = judge(c["q"], r["answers"][0])
+                r["judge"] = "" if grounded else reason
+            r["seconds"] = round(time.time() - t0, 1)
+            with cache_file.open("a", encoding="utf-8") as f:
+                f.write(json.dumps(r, ensure_ascii=False) + chr(10))
+        if "judge" not in r:  # старый формат кэша: вердикт судьи лежал среди ошибок
+            j = [e for e in r.get("errors", []) if e.startswith("ИИ-судья")]
+            r["judge"] = j[0].removeprefix("ИИ-судья: выдумка (").removesuffix(")") if j else ""
+        errors = sorted({e for a in r["answers"] for e in check(c, a)})
+        rows.append(dict(id=r["id"], cat=c["cat"], q=c["q"], answers=r["answers"], passed=not errors, errors=errors,
+                         judge=r["judge"], seconds=r.get("seconds")))
         print(version, c["id"], "PASS" if not errors else "FAIL " + "; ".join(errors), flush=True)
     (OUT / f"{version}.json").write_text(json.dumps(rows, ensure_ascii=False, indent=1), encoding="utf-8")
     return rows
