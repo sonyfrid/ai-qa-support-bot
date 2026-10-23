@@ -2,3 +2,4 @@
 __pycache__/
 results/*.cache.jsonl
 results_log.txt
+results/run.log
