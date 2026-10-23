@@ -1,12 +1,12 @@
 """Прогон тест-кейсов по версиям промпта -> results/<версия>.json и results/report.md.
-python run_eval.py v1 v2"""
+python run_eval.py v1 v2 v3"""
 import json
 import pathlib
 import re
 import sys
 import time
 
-from assistant import KB, answer, chat
+from assistant import KB, answer, chat, guarded
 from cases import CASES
 
 OUT = pathlib.Path(__file__).parent / "results"
@@ -55,6 +55,16 @@ def judge(q: str, a: str) -> tuple[bool, str]:
         return True, f"судья ответил не JSON: {raw[:80]}"
 
 
+def v2_answers(case_id: str) -> list[str] | None:
+    f = OUT / "v2.cache.jsonl"
+    if f.exists():
+        for line in f.read_text(encoding="utf-8").splitlines():
+            r = json.loads(line)
+            if r["id"] == case_id:
+                return r["answers"]
+    return None
+
+
 def run(version: str) -> list[dict]:
     # кэш: прерванный прогон продолжается с того же места, а проверки пересчитываются по сохранённым ответам
     cache_file = OUT / f"{version}.cache.jsonl"
@@ -68,9 +78,15 @@ def run(version: str) -> list[dict]:
         r = done.get(c["id"])
         if r is None:
             t0 = time.time()
-            r = dict(id=c["id"], cat=c["cat"], q=c["q"], answers=[answer(c["q"], version) for _ in range(c.get("repeat", 1))])
+            if version == "v3":
+                # v3 = промпт v2 + фильтр: фильтр проверяет уже полученные ответы v2, модель спрашивается только для повтора
+                firsts = v2_answers(c["id"]) or [None] * c.get("repeat", 1)
+                outs = [guarded(c["q"], f) for f in firsts]
+                r = dict(id=c["id"], cat=c["cat"], q=c["q"], answers=[o[0] for o in outs], guard=[o[1] for o in outs if o[1]])
+            else:
+                r = dict(id=c["id"], cat=c["cat"], q=c["q"], answers=[answer(c["q"], version) for _ in range(c.get("repeat", 1))])
             # Судья (та же 7B-модель) только для справки: в вердикт не входит, см. README
-            if c.get("judge") and c["cat"] == "Галлюцинации":
+            if c.get("judge") and c["cat"] == "Галлюцинации" and version != "v3":
                 grounded, reason = judge(c["q"], r["answers"][0])
                 r["judge"] = "" if grounded else reason
             r["seconds"] = round(time.time() - t0, 1)
@@ -81,7 +97,7 @@ def run(version: str) -> list[dict]:
             r["judge"] = j[0].removeprefix("ИИ-судья: выдумка (").removesuffix(")") if j else ""
         errors = sorted({e for a in r["answers"] for e in check(c, a)})
         rows.append(dict(id=r["id"], cat=c["cat"], q=c["q"], answers=r["answers"], passed=not errors, errors=errors,
-                         judge=r["judge"], seconds=r.get("seconds")))
+                         judge=r["judge"], guard=r.get("guard", []), seconds=r.get("seconds")))
         print(version, c["id"], "PASS" if not errors else "FAIL " + "; ".join(errors), flush=True)
     (OUT / f"{version}.json").write_text(json.dumps(rows, ensure_ascii=False, indent=1), encoding="utf-8")
     return rows
@@ -103,12 +119,16 @@ def report(results: dict[str, list[dict]]) -> str:
             if not r["passed"]:
                 lines += [f"**{r['id']}** ({r['cat']}): {r['q']}", "", f"> {r['answers'][0][:400]}".replace("\n", " "), "",
                           "- " + "\n- ".join(r["errors"]), ""]
+    guarded_rows = [r for v in vs for r in results[v] if r.get("guard")]
+    if guarded_rows:
+        lines += ["", "## Что сделал фильтр v3", "", "| Кейс | Срабатывание | Итог |", "|---|---|---|"]
+        lines += [f"| {r['id']} | {'; '.join(r['guard'])} | {'прошёл' if r['passed'] else 'упал'} |" for r in guarded_rows]
     return "\n".join(lines)
 
 
 if __name__ == "__main__":
     OUT.mkdir(exist_ok=True)
-    versions = sys.argv[1:] or ["v1", "v2"]
+    versions = sys.argv[1:] or ["v1", "v2", "v3"]
     results = {v: run(v) for v in versions}
     (OUT / "report.md").write_text(report(results), encoding="utf-8")
     print("готово:", OUT / "report.md")
